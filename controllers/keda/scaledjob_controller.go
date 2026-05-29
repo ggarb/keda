@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,8 +60,7 @@ type ScaledJobReconciler struct {
 	EventEmitter      eventemitter.EventHandler
 	AuthClientSet     *authentication.AuthClientSet
 
-	scaledJobGenerations *sync.Map
-	scaleHandler         scaling.ScaleHandler
+	scaleHandler scaling.ScaleHandler
 }
 
 type scaledJobMetricsData struct {
@@ -83,7 +81,6 @@ func init() {
 // SetupWithManager initializes the ScaledJobReconciler instance and starts a new controller managed by the passed Manager instance.
 func (r *ScaledJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	r.scaleHandler = scaling.NewScaleHandler(mgr.GetClient(), nil, mgr.GetScheme(), r.GlobalHTTPTimeout, mgr.GetEventRecorderFor("scale-handler"), r.AuthClientSet)
-	r.scaledJobGenerations = &sync.Map{}
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
 		// Ignore updates to ScaledJob Status (in this case metadata.Generation does not change)
@@ -156,7 +153,7 @@ func (r *ScaledJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	} else {
 		wasReady := conditions.GetReadyCondition()
 		if wasReady.IsFalse() || wasReady.IsUnknown() {
-			r.EventEmitter.Emit(scaledJob, req.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ScaledObjectReadyType, eventreason.ScaledJobReady, message.ScaledJobReadyMsg)
+			r.EventEmitter.Emit(scaledJob, req.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ScaledJobReadyType, eventreason.ScaledJobReady, message.ScaledJobReadyMsg)
 		}
 		reqLogger.V(1).Info(msg)
 		conditions.SetReadyCondition(metav1.ConditionTrue, "ScaledJobReady", msg)
@@ -227,35 +224,29 @@ func (r *ScaledJobReconciler) reconcileScaledJob(ctx context.Context, logger log
 	return "ScaledJob is defined correctly and is ready to scaling", nil
 }
 
-// checkIfPaused checks the presence of "autoscaling.keda.sh/paused" annotation on the scaledJob and stop the scale loop.
+// checkIfPaused checks the presence of "autoscaling.keda.sh/paused" annotation on the scaledJob and stops the scale loop.
 func (r *ScaledJobReconciler) checkIfPaused(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob, conditions *kedav1alpha1.Conditions) (bool, error) {
-	pausedAnnotationValue, pausedAnnotation := scaledJob.GetAnnotations()[kedav1alpha1.PausedAnnotation]
-	pausedStatus := conditions.GetPausedCondition().Status == metav1.ConditionTrue
-	shouldPause := false
-	if pausedAnnotation {
-		var err error
-		shouldPause, err = strconv.ParseBool(pausedAnnotationValue)
-		if err != nil {
-			shouldPause = true
-		}
-	}
+	shouldPause := scaledJob.NeedToBePausedByAnnotation()
+	isPausedInStatus := conditions.GetPausedCondition().Status == metav1.ConditionTrue
+
 	if shouldPause {
-		if !pausedStatus {
-			logger.Info("ScaledJob is paused, stopping scaling loop.")
+		// Set Paused condition before stopping scale loop to prevent races with new reconciles
+		if !isPausedInStatus {
 			msg := kedav1alpha1.ScaledJobConditionPausedMessage
-			if err := r.stopScaleLoop(ctx, logger, scaledJob); err != nil {
-				msg = "failed to stop the scale loop for paused ScaledJob"
-				conditions.SetPausedCondition(metav1.ConditionFalse, "ScaledJobStopScaleLoopFailed", msg)
-				r.EventEmitter.Emit(scaledJob, scaledJob.Namespace, corev1.EventTypeWarning, eventingv1alpha1.ScaledJobFailedType, eventreason.ScaledJobPauseFailed, msg)
+			conditions.SetPausedCondition(metav1.ConditionTrue, kedav1alpha1.ScaledJobConditionPausedReason, msg)
+			if err := kedastatus.SetStatusConditions(ctx, r.Client, logger, scaledJob, conditions); err != nil {
 				return false, err
 			}
-			conditions.SetPausedCondition(metav1.ConditionTrue, kedav1alpha1.ScaledJobConditionPausedReason, msg)
 			r.EventEmitter.Emit(scaledJob, scaledJob.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ScaledJobPausedType, eventreason.ScaledJobPaused, msg)
+		}
+
+		if err := r.stopScaleLoop(ctx, logger, scaledJob); err != nil {
+			return false, err
 		}
 		return true, nil
 	}
-	if pausedStatus {
-		logger.Info("Unpausing ScaledJob.")
+
+	if isPausedInStatus {
 		msg := kedav1alpha1.ScaledJobConditionUnpausedMessage
 		conditions.SetPausedCondition(metav1.ConditionFalse, kedav1alpha1.ScaledJobConditionUnpausedReason, msg)
 		r.EventEmitter.Emit(scaledJob, scaledJob.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ScaledJobUnpausedType, eventreason.ScaledJobUnpaused, msg)
@@ -327,37 +318,13 @@ func (r *ScaledJobReconciler) deletePreviousVersionScaleJobs(ctx context.Context
 // requestScaleLoop request ScaleLoop handler for the respective ScaledJob
 func (r *ScaledJobReconciler) requestScaleLoop(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob) error {
 	logger.V(1).Info("Starting a new ScaleLoop")
-	key, err := cache.MetaNamespaceKeyFunc(scaledJob)
-	if err != nil {
-		logger.Error(err, "Error getting key for scaledJob")
-		return err
-	}
-
-	if err = r.scaleHandler.HandleScalableObject(ctx, scaledJob); err != nil {
-		return err
-	}
-
-	r.scaledJobGenerations.Store(key, scaledJob.Generation)
-
-	return nil
+	return r.scaleHandler.HandleScalableObject(ctx, scaledJob)
 }
 
 // stopScaleLoop stops ScaleLoop handler for the respective ScaledJob
 func (r *ScaledJobReconciler) stopScaleLoop(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob) error {
 	logger.V(1).Info("Stopping a ScaleLoop")
-
-	key, err := cache.MetaNamespaceKeyFunc(scaledJob)
-	if err != nil {
-		logger.Error(err, "Error getting key for scaledJob")
-		return err
-	}
-
-	if err = r.scaleHandler.DeleteScalableObject(ctx, scaledJob); err != nil {
-		return err
-	}
-
-	r.scaledJobGenerations.Delete(key)
-	return nil
+	return r.scaleHandler.DeleteScalableObject(ctx, scaledJob)
 }
 
 func (r *ScaledJobReconciler) updatePromMetrics(scaledJob *kedav1alpha1.ScaledJob, namespacedName string) {

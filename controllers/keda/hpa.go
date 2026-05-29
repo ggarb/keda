@@ -33,7 +33,6 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	kedacontrollerutil "github.com/kedacore/keda/v2/controllers/keda/util"
-	"github.com/kedacore/keda/v2/pkg/scaling/executor"
 	kedastatus "github.com/kedacore/keda/v2/pkg/status"
 	version "github.com/kedacore/keda/v2/version"
 )
@@ -162,19 +161,6 @@ func (r *ScaledObjectReconciler) newHPAForScaledObject(ctx context.Context, logg
 	minReplicas := scaledObject.GetHPAMinReplicas()
 	maxReplicas := scaledObject.GetHPAMaxReplicas()
 
-	pausedCount, err := executor.GetPausedReplicaCount(scaledObject)
-	if err != nil {
-		return nil, err
-	}
-	if pausedCount != nil {
-		// MinReplicas on HPA can't be 0
-		if *pausedCount == 0 {
-			*pausedCount = 1
-		}
-		minReplicas = pausedCount
-		maxReplicas = *pausedCount
-	}
-
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
 			MinReplicas: minReplicas,
@@ -284,6 +270,12 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 	}
 
 	metricSpecs := cache.GetMetricSpecForScaling(ctx)
+
+	if len(metricSpecs) == 0 {
+		err := fmt.Errorf("no metric specs returned from scalers for ScaledObject %s/%s", scaledObject.Namespace, scaledObject.Name)
+		logger.Error(err, "Scalers may be unreachable, will retry")
+		return nil, err
+	}
 
 	for _, metricSpec := range metricSpecs {
 		if metricSpec.Resource != nil {
