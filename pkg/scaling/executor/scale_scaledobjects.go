@@ -84,7 +84,7 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 			logger.V(1).Info("Some triggers defined in ScaledObject are not working correctly")
 		default:
 			// triggers are active, but we didn't need to scale (replica count > 0)
-			result.LastActiveTime = &metav1.Time{Time: time.Now()}
+			result.LastActiveTime = lastActiveTimeToRecord(scaledObject, minReplicas, time.Now())
 		}
 	} else {
 		// isActive == false
@@ -203,7 +203,7 @@ func (e *scaleExecutor) scaleToZeroOrIdle(ctx context.Context, logger logr.Logge
 		return
 	}
 
-	var initialCooldownPeriod, cooldownPeriod time.Duration
+	var initialCooldownPeriod time.Duration
 
 	if scaledObject.Spec.InitialCooldownPeriod != nil {
 		initialCooldownPeriod = time.Second * time.Duration(*scaledObject.Spec.InitialCooldownPeriod)
@@ -211,11 +211,7 @@ func (e *scaleExecutor) scaleToZeroOrIdle(ctx context.Context, logger logr.Logge
 		initialCooldownPeriod = time.Second * time.Duration(defaultInitialCooldownPeriod)
 	}
 
-	if scaledObject.Spec.CooldownPeriod != nil {
-		cooldownPeriod = time.Second * time.Duration(*scaledObject.Spec.CooldownPeriod)
-	} else {
-		cooldownPeriod = time.Second * time.Duration(defaultCooldownPeriod)
-	}
+	cooldownPeriod := getCooldownPeriod(scaledObject)
 
 	// LastActiveTime can be nil if the ScaleTarget was scaled outside of KEDA.
 	// In this case we will ignore the cooldown period and scale it down
@@ -334,6 +330,31 @@ func (e *scaleExecutor) handlePaused(scaledObject *kedav1alpha1.ScaledObject, sc
 		return true
 	}
 	return false
+}
+
+func getCooldownPeriod(scaledObject *kedav1alpha1.ScaledObject) time.Duration {
+	if scaledObject.Spec.CooldownPeriod != nil {
+		return time.Second * time.Duration(*scaledObject.Spec.CooldownPeriod)
+	}
+	return time.Second * time.Duration(defaultCooldownPeriod)
+}
+
+// lastActiveTimeToRecord returns the LastActiveTime to persist for an active
+// ScaledObject that needed no scaling, or nil to leave the status unchanged.
+// LastActiveTime is only read by scaleToZeroOrIdle, and refreshing it every
+// poll costs one status write per ScaledObject per pollingInterval, so:
+//   - a ScaledObject that can't scale to zero or idle never records it;
+//   - otherwise it's refreshed at most every cooldownPeriod/2, so scale-in can
+//     start at most that much before the full cooldown has elapsed.
+func lastActiveTimeToRecord(scaledObject *kedav1alpha1.ScaledObject, minReplicas int32, now time.Time) *metav1.Time {
+	if scaledObject.Spec.IdleReplicaCount == nil && minReplicas > 0 {
+		return nil
+	}
+	last := scaledObject.Status.LastActiveTime
+	if last != nil && now.Sub(last.Time) < getCooldownPeriod(scaledObject)/2 {
+		return nil
+	}
+	return &metav1.Time{Time: now}
 }
 
 // getIdleOrMinimumReplicaCount returns true if the second value returned is from IdleReplicaCount

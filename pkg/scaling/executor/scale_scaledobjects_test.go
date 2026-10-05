@@ -1355,3 +1355,48 @@ func TestRequestScale_ScalerErrorWithFallback_HPAHealthy(t *testing.T) {
 	readyCond := result.Conditions.GetReadyCondition()
 	assert.Truef(t, readyCond.IsTrue(), "with fallback configured and HPA healthy, Ready should be True, got %s/%s", readyCond.Status, readyCond.Reason)
 }
+
+func TestNoLastActiveTimeWhenActiveAndCannotScaleToZero(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	client := mock_client.NewMockClient(ctrl)
+	recorder := events.NewFakeRecorder(1)
+	mockScaleClient := mock_scale.NewMockScalesGetter(ctrl)
+
+	scaleExecutor := NewScaleExecutor(client, mockScaleClient, nil, kubernetesAPITimeout, recorder)
+
+	minReplicas := int32(1)
+	currentReplicas := int32(3)
+
+	scaledObject := v1alpha1.ScaledObject{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "name",
+			Namespace: "namespace",
+		},
+		Spec: v1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &v1alpha1.ScaleTarget{
+				Name: "name",
+			},
+			MinReplicaCount: &minReplicas,
+		},
+		Status: v1alpha1.ScaledObjectStatus{
+			ScaleTargetGVKR: &v1alpha1.GroupVersionKindResource{
+				Group: "apps",
+				Kind:  "Deployment",
+			},
+		},
+	}
+
+	scaledObject.Status.Conditions = *v1alpha1.GetInitializedConditions()
+
+	client.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).SetArg(2, appsv1.Deployment{
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &currentReplicas,
+		},
+	})
+
+	result := scaleExecutor.RequestScale(context.TODO(), &scaledObject, true, false, ScaleExecutorOptions{})
+
+	condition := result.Conditions.GetActiveCondition()
+	assert.Equal(t, true, condition.IsTrue())
+	assert.Nil(t, result.LastActiveTime)
+}

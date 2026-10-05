@@ -18,10 +18,12 @@ package executor
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 )
@@ -185,6 +187,63 @@ func TestGetFinishedJobConditionType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, e.getFinishedJobConditionType(&tt.job))
+		})
+	}
+}
+
+func TestLastActiveTimeToRecord(t *testing.T) {
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	at := func(ago time.Duration) *metav1.Time { return &metav1.Time{Time: now.Add(-ago)} }
+	tests := []struct {
+		name        string
+		spec        kedav1alpha1.ScaledObjectSpec
+		minReplicas int32
+		last        *metav1.Time
+		expectWrite bool
+	}{
+		{
+			name:        "minReplicas > 0 and no idle count never records",
+			minReplicas: 1,
+			last:        at(time.Hour),
+			expectWrite: false,
+		},
+		{
+			name:        "minReplicas 0 with no previous time records",
+			minReplicas: 0,
+			expectWrite: true,
+		},
+		{
+			name:        "minReplicas 0 refreshed under half the default cooldown ago is skipped",
+			minReplicas: 0,
+			last:        at(149 * time.Second),
+			expectWrite: false,
+		},
+		{
+			name:        "minReplicas 0 refreshed half the default cooldown ago records",
+			minReplicas: 0,
+			last:        at(150 * time.Second),
+			expectWrite: true,
+		},
+		{
+			name:        "idle count set uses the custom cooldown",
+			spec:        kedav1alpha1.ScaledObjectSpec{IdleReplicaCount: new(int32(0)), CooldownPeriod: new(int32(60))},
+			minReplicas: 2,
+			last:        at(31 * time.Second),
+			expectWrite: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			so := &kedav1alpha1.ScaledObject{Spec: tt.spec, Status: kedav1alpha1.ScaledObjectStatus{LastActiveTime: tt.last}}
+			got := lastActiveTimeToRecord(so, tt.minReplicas, now)
+			if !tt.expectWrite {
+				assert.Nil(t, got)
+				return
+			}
+			if assert.NotNil(t, got) {
+				assert.Equal(t, now, got.Time)
+			}
 		})
 	}
 }
