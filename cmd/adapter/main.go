@@ -324,6 +324,15 @@ func main() {
 		return
 	}
 
+	config, err := cmd.Config()
+	if err != nil {
+		setupLog.Error(err, "building adapter server config")
+		return
+	}
+	if config.GenericConfig.Authorization.Authorizer != nil {
+		config.GenericConfig.Authorization.Authorizer = kedautil.NewSelectorlessAuthorizer(config.GenericConfig.Authorization.Authorizer)
+	}
+
 	setupLog.Info(cmd.Message)
 
 	RunMetricsServer(ctx)
